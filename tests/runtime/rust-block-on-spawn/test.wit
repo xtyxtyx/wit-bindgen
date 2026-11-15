@@ -1,0 +1,16 @@
+//@ async = true
+package test:rust-block-on-spawn;
+
+interface i {
+  ping: async func();
+}
+
+world test {
+  export i;
+}
+
+world runner {
+  import i;
+
+  export run: async func();
+}

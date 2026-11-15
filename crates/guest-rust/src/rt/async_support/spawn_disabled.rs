@@ -3,6 +3,14 @@ use alloc::boxed::Box;
 use core::future::Future;
 use core::task::{Context, Poll};
 
+/// Without spawning there is nothing to queue.
+#[derive(Default)]
+pub struct Spawned;
+
+impl Spawned {
+    pub fn clear(&self) {}
+}
+
 #[derive(Default)]
 pub struct Tasks<'a> {
     future: Option<BoxFuture<'a>>,
@@ -19,7 +27,7 @@ impl<'a> Tasks<'a> {
         self.future = None;
     }
 
-    pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+    pub fn poll_next(&mut self, cx: &mut Context<'_>, _spawned: &Spawned) -> Poll<()> {
         if let Some(future) = self.future.as_mut() {
             if future.as_mut().poll(cx).is_ready() {
                 self.future = None;

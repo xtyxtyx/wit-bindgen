@@ -1,13 +1,10 @@
-// TODO: Switch to interior mutability (e.g. use Mutexes or thread-local
-// RefCells) and remove this, since even in single-threaded mode `static mut`
-// references can be a hazard due to recursive access.
-#![allow(static_mut_refs)]
-
 use super::cabi;
+use super::try_lock::TryLock;
 use crate::rt::async_support::BoxFuture;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::future::Future;
+use core::mem;
 use core::pin::Pin;
 use core::ptr;
 use core::task::{Context, Poll};
@@ -15,9 +12,41 @@ use futures::channel::oneshot;
 use futures::future::{AbortHandle, Abortable, Aborted};
 use futures::stream::{FuturesUnordered, StreamExt};
 
-/// Any newly-deferred work queued by calls to the `spawn` function while
-/// polling the current task.
-static mut SPAWNED: Vec<BoxFuture> = Vec::new();
+/// Newly-deferred work queued by calls to the `spawn` function while one task
+/// was current, waiting for that task's `Tasks` to take it in.
+///
+/// Each task has its own queue so that a task spawned by one computation is
+/// never taken in by another, such as a `block_on` started right after the
+/// spawn.
+#[derive(Default)]
+pub struct Spawned(TryLock<SpawnedFutures>);
+
+#[derive(Default)]
+struct SpawnedFutures(Vec<BoxFuture<'static>>);
+
+// SAFETY: the futures are only pushed and taken on the thread that runs the
+// task they were spawned in, as with the waitables of `SharedTaskState`. The
+// queue lives in that shared state, which `Waker` requires to be `Send` and
+// `Sync`.
+unsafe impl Send for SpawnedFutures {}
+
+impl Spawned {
+    pub fn push(&self, task: BoxFuture<'static>) {
+        self.0.try_lock().unwrap().0.push(task);
+    }
+
+    /// Takes every queued future out, leaving the queue empty and unlocked so
+    /// that dropping or polling them may spawn again.
+    pub fn take(&self) -> Vec<BoxFuture<'static>> {
+        mem::take(&mut self.0.try_lock().unwrap().0)
+    }
+
+    /// Drops every queued future, outside the lock since their destructors
+    /// may spawn again.
+    pub fn clear(&self) {
+        drop(self.take());
+    }
+}
 
 #[derive(Default)]
 pub struct Tasks<'a> {
@@ -43,19 +72,19 @@ impl<'a> Tasks<'a> {
         }
     }
 
-    pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+    /// Polls these tasks, taking in the ones queued in `queue`, the queue of
+    /// the task these belong to.
+    pub fn poll_next(&mut self, cx: &mut Context<'_>, queue: &Spawned) -> Poll<()> {
         loop {
             // Perform some work by seeing what's next in this
             // `FuturesUnordered`. Afterwards check the set of spawned tasks
             // and, if any, add them to our set of tasks being done.
             let poll = self.tasks.poll_next_unpin(cx);
-            let spawned = unsafe {
-                if SPAWNED.is_empty() {
-                    false
-                } else {
-                    self.tasks.extend(SPAWNED.drain(..));
-                    true
-                }
+            let spawned = {
+                let new = queue.take();
+                let any = !new.is_empty();
+                self.tasks.extend(new);
+                any
             };
             match poll {
                 // If no tasks were ready, and if we didn't spawn any work,
@@ -88,12 +117,6 @@ impl<'a> Tasks<'a> {
 
     pub fn is_empty(&self) -> bool {
         self.tasks.is_empty()
-    }
-}
-
-pub(super) fn push(task: BoxFuture<'static>) {
-    unsafe {
-        SPAWNED.push(task);
     }
 }
 
@@ -146,14 +169,15 @@ pub fn spawn_local<T: 'static>(future: impl Future<Output = T> + 'static) -> Joi
         let _ = sender.send(Abortable::new(future, registration).await);
     });
 
-    // This isn't quite as easy as just pushing onto the `SPAWNED` static within
-    // this file because the request for spawning a task can come from any
-    // version of the `wit-bindgen` crate but only the version that's running
-    // the exported task is actually capable of handling the request to spawn
-    // something. This means that our `SPAWNED` static may not actually be read
-    // by the export running because it might be a different version of
-    // `wit-bindgen`. To arbitrate this the `cabi` module has a hook, which is
-    // configured by exports, to receive Rust futures to spawn.
+    // This isn't quite as easy as just pushing onto the current task's
+    // `Spawned` queue because the request for spawning a task can come from
+    // any version of the `wit-bindgen` crate but only the version that's
+    // running the exported task is actually capable of handling the request to
+    // spawn something. This means that the current task may not even have a
+    // `Spawned` queue of this version because it might be run by a different
+    // version of `wit-bindgen`. To arbitrate this the `cabi` module has a
+    // hook, which is configured by exports, to receive Rust futures to spawn
+    // into the task it's handed.
     //
     // This itself is a bit thorny to handle a few cases:
     //
